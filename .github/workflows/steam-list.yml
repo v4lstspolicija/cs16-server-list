@@ -1,0 +1,35 @@
+# Rebuilds steam_servers.txt (Counter-Strike 1.6 servers from Steam, fake servers removed by the
+# fakeservers.link rules) once a day. Backup source for the Mac game when the main site is down.
+# Needs the repository secret STEAM_API_KEY (Settings > Secrets and variables > Actions).
+name: steam server list
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: steam-list
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect and filter
+        env:
+          STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$STEAM_API_KEY" > "$RUNNER_TEMP/key"
+          python3 -I steam-list.py "$RUNNER_TEMP/key" steam_servers.txt
+          rm -f "$RUNNER_TEMP/key"
+      - name: Publish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add steam_servers.txt
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git commit -q -m "server list $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
