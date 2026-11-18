@@ -23,19 +23,44 @@ accounts that have spent at least $5 on Steam.
 3. **Add your key as a secret**: in your repository open **Settings > Secrets and variables >
    Actions > New repository secret**. Name: `STEAM_API_KEY`, value: your key. Secrets are never
    shown in logs or files, and people who fork your repository don't get them.
-4. **Allow the job to save the list**: **Settings > Actions > General > Workflow permissions**, select
-   **Read and write permissions** and save.
-5. **Run it once**: **Actions** tab > **steam server list** > **Run workflow**. If a page says that
-   workflows are disabled for a fork, click **I understand my workflows, go ahead and enable them**
-   first. It takes about 3 minutes; then `steam_servers.txt` appears in your repository.
-   After that it runs by itself every day at 04:17 UTC. To change that, edit the `cron:` line in
-   `.github/workflows/steam-list.yml` (for example `"17 */6 * * *"` for every 6 hours).
+4. **Set up the Actions job**: see [Setting up GitHub Actions](#setting-up-github-actions) below.
+5. **Check the result**: after the first run, `steam_servers.txt` in your repository has your own
+   list (a fork starts with a copy of this repository's list until your first run replaces it).
 6. **Use it in the game**: see [Using a list in the game](#using-a-list-in-the-game) below.
    Your list's address is
    `https://raw.githubusercontent.com/YOUR-NAME/YOUR-REPO/main/steam_servers.txt`.
 
-The job log (Actions tab, open a run, step **Collect and filter**) shows how many servers Steam
-returned and how many were hidden for each rule.
+## Setting up GitHub Actions
+
+GitHub Actions is what runs `steam-list.py` for you every day. The job is already written
+(`.github/workflows/steam-list.yml`); you only have to switch it on.
+
+1. **Allow the job to save the list.** Open **Settings** (top of your repository) > **Actions** >
+   **General**. Scroll down to **Workflow permissions**, choose **Read and write permissions** and
+   click **Save**. Without this, the job can't commit `steam_servers.txt`.
+2. **Turn on Actions (forks only).** Open the **Actions** tab. A fork shows the message
+   *"Workflows aren't being run on this forked repository"*. Click the green button
+   **I understand my workflows, go ahead and enable them**. GitHub switches off scheduled jobs in
+   every fork until you do this. If you made a new repository instead of forking, skip this step.
+3. **Start the first run.** Still in **Actions**, click **steam server list** in the list on the
+   left. On the right click **Run workflow**, keep branch `main`, and click the green
+   **Run workflow** button. If a yellow note says *"This scheduled workflow is disabled"*, click
+   **Enable workflow** first.
+4. **Wait for it.** A new run appears with a yellow dot (running). After about 3 minutes it turns
+   into a green check. Open the run, click **build**, then the step **Collect and filter** to see
+   how many servers Steam returned and how many fakes were hidden.
+5. **Done.** From now on it runs by itself every day at 04:17 UTC. Every run that finds a change
+   adds a commit called `server list <date>`. To run it more often, edit the `cron:` line in
+   `.github/workflows/steam-list.yml`; for example `"17 */6 * * *"` runs every 6 hours. Steam
+   allows 100 000 API calls a day and one run uses about 130.
+
+**If the run fails (red X)**, open it and look at the last lines of the failed step:
+
+| Error | Fix |
+| --- | --- |
+| `HTTP Error 403: Forbidden` in **Collect and filter** | The `STEAM_API_KEY` secret is missing or wrong. Check its name is exactly `STEAM_API_KEY` and paste the key again. |
+| `Permission to ... denied to github-actions[bot]` in **Publish** | Do step 1 above (Read and write permissions), then run it again. |
+| `HTTP Error 429` or a timeout | Steam is busy or the key hit its daily limit. It runs again tomorrow, or click **Re-run jobs**. |
 
 GitHub pauses scheduled jobs in public repositories after 60 days without activity. The daily list
 commits normally count as activity, but if it ever stops, open the Actions tab and click
