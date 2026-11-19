@@ -5,14 +5,23 @@ Steam Web API IGameServersService/GetServerList returns at most 10 000 rows per 
 fakes alone are >100 000 listings, so (like fakeservers.link, github.com/romashuhov/fakeservers.link)
 the query is split into smaller buckets until none is capped. Then these are dropped:
   - farms: 3+ listings with the same name + map + max players (fakeservers.link's definition)
-  - 10+ listings on one IP, 50+ in one /24
+  - 40+ listings on one IP, 200+ in one /24 (fake farms); smaller crowds (10+ on an IP or
+    50+ in a /24: hosting companies, common in AR / KZ / UZ / CN) are kept only if they
+    answer our own query and pass the checks below
   - more than 32 slots or more players than slots (impossible on GoldSrc)
   - private / reserved addresses
+Then every remaining server is asked for its info and player list (like the game does) and
+these are dropped too (a server that doesn't answer is kept):
+  - fake players: 3+ undeclared players with the very same connection time, or 4+ (and 90%)
+    with whole-second times; real connection times have a random fraction, only bots
+    (which servers declare) show whole seconds
+  - name switching: a second answer 2 s later carries a different server's name (proxies
+    copying other servers); 2+ such ports on one IP drop every server on that IP
 
 usage: steam-list.py KEYFILE OUTFILE
 Writes "ip:port" lines. Python 3 standard library only.
 """
-import collections, json, re, sys, time, urllib.parse, urllib.request
+import collections, json, re, select, socket, struct, sys, time, urllib.parse, urllib.request
 
 ENDPOINT = "https://api.steampowered.com/IGameServersService/GetServerList/v1/"
 CAP = 10000 - 20
@@ -72,6 +81,158 @@ class Collector:
             self.by_maps(flt, rows)
 
 
+# ---- probing: A2S_INFO twice and A2S_PLAYER, all servers in parallel over one UDP socket
+HDR = b"\xff\xff\xff\xff"
+A2S_INFO = HDR + b"TSource Engine Query\x00"
+A2S_PLAYER = HDR + b"U"
+
+
+def _cstr(d, c):
+    e = d.index(b"\0", c)
+    return d[c:e].decode("utf-8", "replace"), e + 1
+
+
+def _info(d):
+    if d[4:5] == b"I":
+        c = 6
+        name, c = _cstr(d, c)
+        for _ in range(3):
+            _, c = _cstr(d, c)
+        return {"name": name, "players": d[c + 2], "bots": d[c + 4]}
+    if d[4:5] == b"m":
+        c = 5
+        _, c = _cstr(d, c)
+        name, c = _cstr(d, c)
+        for _ in range(3):
+            _, c = _cstr(d, c)
+        pl = d[c]
+        c += 6
+        mod = d[c]
+        c += 1
+        if mod:
+            _, c = _cstr(d, c)
+            _, c = _cstr(d, c)
+            c += 11
+        return {"name": name, "players": pl, "bots": d[c + 1] if c + 1 < len(d) else 0}
+    return None
+
+
+def _players(d):
+    n, c, out = d[5], 6, []
+    for _ in range(n):
+        c += 1
+        name, c = _cstr(d, c)
+        _, dur = struct.unpack_from("<if", d, c)
+        c += 8
+        out.append((name, dur))
+    return out
+
+
+def _round(sock, addrs, kind, got, rate=250, wait=4.0, attempts=2):
+    """send one query type to every address (answering challenges) and collect replies"""
+    splits = {}
+
+    def handle(d, a):
+        if d[:4] == b"\xfe\xff\xff\xff":  # GoldSrc split reply
+            part = splits.setdefault((a, d[4:8]), {})
+            part[d[8] >> 4] = d[9:]
+            if len(part) != d[8] & 15:
+                return
+            d = b"".join(part[i] for i in sorted(part))
+        if d[:4] != HDR or len(d) < 6:
+            return
+        t = d[4:5]
+        try:
+            if t == b"A" and len(d) >= 9:
+                sock.sendto((A2S_INFO if kind == "info" else A2S_PLAYER) + d[5:9], a)
+            elif kind == "info" and t in (b"I", b"m"):
+                v = _info(d)
+                if v and (a not in got or t == b"I"):
+                    got[a] = v
+            elif kind == "players" and t == b"D" and d[5] > 0:
+                got[a] = _players(d)
+        except (ValueError, IndexError, struct.error, OSError):
+            pass
+
+    def drain(until):
+        while time.time() < until:
+            r, _, _ = select.select([sock], [], [], 0.02)
+            while r:
+                try:
+                    d, a = sock.recvfrom(4096)
+                except BlockingIOError:
+                    break
+                handle(d, a)
+
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(1.5)  # servers drop queries that come too fast from one address
+        start, sent = time.time(), 0
+        for a in addrs:
+            if a in got:
+                continue
+            try:
+                sock.sendto(A2S_INFO if kind == "info" else A2S_PLAYER + b"\xff\xff\xff\xff", a)
+            except OSError:
+                continue
+            sent += 1
+            drain(start + sent / rate)
+        drain(time.time() + wait)
+    return got
+
+
+def _letters(n):
+    return re.sub(r"[^a-z\u0080-\uffff]", "", re.sub(r"\^\d", "", n.lower()))
+
+
+def probe(addrs):
+    """returns {addr: reason} for servers that show fake signs"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+    sock.setblocking(False)
+    targets = []
+    for a in addrs:
+        h, p = a.rsplit(":", 1)
+        targets.append((h, int(p)))
+    info1 = _round(sock, targets, "info", {})
+    asked = [a for a, v in info1.items() if v["players"] - v["bots"] >= 3]
+    players = _round(sock, asked, "players", {}, attempts=4)
+    time.sleep(2)
+    info2 = _round(sock, list(info1), "info", {})
+    sock.close()
+
+    bad = {}
+    for a, v in info1.items():
+        key = "%s:%d" % a
+        pl = players.get(a) or []
+        long_times = [d for _, d in pl if d > 600]
+        same = max([sum(1 for y in long_times if abs(x - y) < 0.05) for x in long_times] or [0])
+        timed = [d for _, d in pl if 60 < d < 100000]
+        whole = sum(1 for d in timed if abs(d - round(d)) < 0.001)
+        if same - v["bots"] >= 3:
+            bad[key] = "fake players (same connection time)"
+        elif whole - v["bots"] >= 4 and whole * 10 >= len(timed) * 9:
+            bad[key] = "fake players (whole-second times)"
+        elif a in info2:
+            x, y = _letters(v["name"]), _letters(info2[a]["name"])
+            common = 0
+            while common < min(len(x), len(y)) and x[common] == y[common]:
+                common += 1
+            if len(x) >= 6 and len(y) >= 6 and common < 6:
+                bad[key] = "switches to other servers' names"
+    # proxy farms: 2+ name-switching ports on one IP -> every server on that IP
+    farms = collections.Counter(k.rsplit(":", 1)[0] for k, why in bad.items() if why.startswith("switches"))
+    for a in addrs:
+        if farms[a.rsplit(":", 1)[0]] >= 2 and a not in bad:
+            bad[a] = "on a name-switching proxy farm"
+    print("probed %d servers: %d answered, %d of %d player lists" % (len(addrs), len(info1), len(players), len(asked)))
+    # for the second list: servers that answered and run no bots (their own count, either query)
+    probe.answered = set("%s:%d" % a for a in info1)
+    probe.no_bots = set("%s:%d" % a for a, v in info1.items()
+                        if v["bots"] == 0 and info2.get(a, v)["bots"] == 0)
+    return bad
+
+
 def main():
     keyfile, out = sys.argv[1], sys.argv[2]
     key = re.sub(r"[^A-Za-z0-9]", "", open(keyfile).read())
@@ -96,23 +257,41 @@ def main():
             return True
 
     why = collections.Counter()
-    keep = []
+    keep, crowded = [], set()
     for s in servers:
         i, mx, pl = ip(s), s.get("max_players", 0), s.get("players", 0)
         if unroutable(i): why["private/reserved address"] += 1
         elif per_sig[sig(s)] >= 3: why["farm (same name+map+slots on 3+)"] += 1
-        elif per_ip[i] >= 10: why["10+ on one IP"] += 1
-        elif per_net[i.rsplit(".", 1)[0]] >= 50: why["50+ in one /24"] += 1
+        elif per_ip[i] >= 40: why["40+ on one IP"] += 1
+        elif per_net[i.rsplit(".", 1)[0]] >= 200: why["200+ in one /24"] += 1
         elif mx > 32 or mx < 1 or pl > mx: why["impossible slots/players"] += 1
         elif not norm(s.get("name")) or not s.get("map"): why["empty name/map"] += 1
-        else: keep.append(s["addr"])
+        else:
+            keep.append(s["addr"])
+            if per_ip[i] >= 10 or per_net[i.rsplit(".", 1)[0]] >= 50:
+                crowded.add(s["addr"])
 
     if not keep:
         sys.exit("no servers left, keeping the old list")
+
+    bad = probe(keep)
+    for a in crowded:
+        if a not in bad and a not in probe.answered:
+            bad[a] = "crowded IP/network and didn't answer"
+    for reason in bad.values():
+        why[reason] += 1
+    keep = [a for a in keep if a not in bad]
     with open(out + ".tmp", "w") as f:
         f.write("\n".join(sorted(keep)) + "\n")
     import os
     os.replace(out + ".tmp", out)
+    # second list: the same servers, only those that answered and have no bots
+    nobots = [a for a in keep if a in probe.no_bots]
+    out2 = out[:-4] + "_nobots.txt" if out.endswith(".txt") else out + "_nobots"
+    with open(out2 + ".tmp", "w") as f:
+        f.write("\n".join(sorted(nobots)) + "\n")
+    os.replace(out2 + ".tmp", out2)
+    print("%d servers without bots written to %s" % (len(nobots), out2))
     print("%d API calls%s, %d listings, %d kept" % (c.calls, " (truncated)" if c.truncated else "", len(servers), len(keep)))
     for k, v in why.most_common():
         print("  hidden %6d  %s" % (v, k))
