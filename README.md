@@ -5,9 +5,40 @@ the game, one `ip:port` per line. It comes from Valve's master list (Steam Web A
 `IGameServersService/GetServerList`) and is rebuilt once a day by GitHub Actions
 (`.github/workflows/steam-list.yml`).
 
-Fake servers are removed with the rules of [fakeservers.link](https://fakeservers.link):
-farms (3+ listings with the same name, map and slot count), 10+ listings on one IP, 50+ in one /24,
-impossible slot/player counts and private addresses. See `steam-list.py`.
+Fake servers are removed in two steps (see `steam-list.py`):
+
+1. Rules based on [fakeservers.link](https://fakeservers.link): farms (3+ listings with the same
+   name, map and slot count), 40+ listings on one IP, 200+ in one /24, impossible slot/player
+   counts and private addresses. Farms copy the names of real servers, so in a group of copies
+   the listing on an address of its own (fewer than 10 listings) is kept as the original.
+   Originals, and servers on busy hosting addresses (10+ on one IP or 50+ in one /24), are only
+   kept if they answer the check below.
+2. Every remaining server is asked for its info and player list, like the game does, and these
+   are dropped:
+   - **fake players**: 3 or more undeclared players with exactly the same connection time, or
+     4 or more (and 90% of all) with whole-second times. Real connection times have a random
+     fraction; only bots show whole seconds, and real servers declare their bots.
+   - **name switching**: asked again 2 seconds later, the server answers with a different
+     server's name (proxies copying other servers). Two such ports on one IP drop every
+     server on that IP.
+
+   Servers that honestly declare their bots stay in `steam_servers.txt`; the game hides them
+   by default ("Hide servers with bots" in the filters).
+
+Three lists are published:
+
+- `steam_servers.txt`: every server that passed the checks above.
+- `steam_servers_nobots.txt`: the same servers, only those that answered the check and had
+  no bots at all.
+- `steam_servers_noruro.txt`: the same servers without Russian and Romanian ones, like the
+  game's "Hide Russian & Romanian" filter: hosted in Russia or Romania, a `.ru`/`.ro` address or
+  RU tag in the name, Russian- or Romanian-only letters or words, or AMX Mod X language
+  `ru`/`ro`. Servers hosted in Ukraine or Moldova, or with Ukrainian letters, a UA tag or AMX
+  language `ua`/`uk`, are kept unless their name has a `.ru`/`.ro` address. Countries come from
+  the free [DB-IP](https://db-ip.com) country database (IP Geolocation by DB-IP, CC BY 4.0),
+  downloaded on every run.
+
+   A server that doesn't answer is kept, so a server that is briefly down isn't lost.
 
 ## Build your own master list on GitHub
 
