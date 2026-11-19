@@ -260,7 +260,8 @@ def load_countries():
     for m in months:
         url = "https://download.db-ip.com/free/dbip-country-lite-%s.csv.gz" % m
         try:
-            with urllib.request.urlopen(url, timeout=120) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "cs16-server-list/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
                 data = gzip.decompress(r.read())
         except Exception as e:
             print("country database %s: %s" % (m, e))
@@ -372,6 +373,19 @@ def main():
 
     if not keep:
         sys.exit("no servers left, keeping the old list")
+
+    # Steam's answer differs from call to call (some runs miss thousands of listings), so
+    # servers from the previous list that Steam left out this time are checked again and kept
+    # if they still answer and pass the checks. Ones Steam did list and the rules dropped stay out.
+    listed = set(s["addr"] for s in servers)
+    try:
+        previous = set(re.findall(r"^\d+\.\d+\.\d+\.\d+:\d+$", open(out).read(), re.M))
+    except OSError:
+        previous = set()
+    carried = sorted(a for a in previous if a not in listed)
+    keep += carried
+    crowded.update(carried)
+    print("%d servers from the previous list were not in Steam's answer: checking them again" % len(carried))
 
     bad = probe(keep)
     for a in crowded:
