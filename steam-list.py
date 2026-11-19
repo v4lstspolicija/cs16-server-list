@@ -4,7 +4,9 @@
 Steam Web API IGameServersService/GetServerList returns at most 10 000 rows per call and the
 fakes alone are >100 000 listings, so (like fakeservers.link, github.com/romashuhov/fakeservers.link)
 the query is split into smaller buckets until none is capped. Then these are dropped:
-  - farms: 3+ listings with the same name + map + max players (fakeservers.link's definition)
+  - farms: 3+ listings with the same name + map + max players (fakeservers.link's definition),
+    except the original: farms copy real servers' names, so a listing on an IP with fewer than
+    10 listings is kept when at most 2 of the group are like that (it must answer)
   - 40+ listings on one IP, 200+ in one /24 (fake farms); smaller crowds (10+ on an IP or
     50+ in a /24: hosting companies, common in AR / KZ / UZ / CN) are kept only if they
     answer our own query and pass the checks below
@@ -17,6 +19,12 @@ these are dropped too (a server that doesn't answer is kept):
     (which servers declare) show whole seconds
   - name switching: a second answer 2 s later carries a different server's name (proxies
     copying other servers); 2+ such ports on one IP drop every server on that IP
+
+A third list, *_noruro.txt, also leaves out Russian and Romanian servers, like the game's
+"Hide Russian & Romanian" filter: hosted in RU/RO (DB-IP country lite, CC BY 4.0), a .ru/.ro
+address or RU tag in the name, Russian/Romanian-only letters or words, or AMX Mod X language
+ru/ro. Servers hosted in Ukraine or Moldova, or with Ukrainian letters/tags or AMX language
+ua/uk, are kept (a .ru/.ro address in the name still drops them).
 
 usage: steam-list.py KEYFILE OUTFILE
 Writes "ip:port" lines. Python 3 standard library only.
@@ -85,6 +93,9 @@ class Collector:
 HDR = b"\xff\xff\xff\xff"
 A2S_INFO = HDR + b"TSource Engine Query\x00"
 A2S_PLAYER = HDR + b"U"
+A2S_RULES = HDR + b"V"
+QUERY = {"info": A2S_INFO, "players": A2S_PLAYER + HDR, "rules": A2S_RULES + HDR}
+RESEND = {"info": A2S_INFO, "players": A2S_PLAYER, "rules": A2S_RULES}
 
 
 def _cstr(d, c):
@@ -144,13 +155,16 @@ def _round(sock, addrs, kind, got, rate=250, wait=4.0, attempts=2):
         t = d[4:5]
         try:
             if t == b"A" and len(d) >= 9:
-                sock.sendto((A2S_INFO if kind == "info" else A2S_PLAYER) + d[5:9], a)
+                sock.sendto(RESEND[kind] + d[5:9], a)
             elif kind == "info" and t in (b"I", b"m"):
                 v = _info(d)
                 if v and (a not in got or t == b"I"):
                     got[a] = v
             elif kind == "players" and t == b"D" and d[5] > 0:
                 got[a] = _players(d)
+            elif kind == "rules" and t == b"E":
+                m = re.search(rb"amx_lang[a-z]*\x00([^\x00]*)\x00", d)
+                got[a] = m.group(1).decode("utf-8", "replace").strip().lower() if m else ""
         except (ValueError, IndexError, struct.error, OSError):
             pass
 
@@ -172,7 +186,7 @@ def _round(sock, addrs, kind, got, rate=250, wait=4.0, attempts=2):
             if a in got:
                 continue
             try:
-                sock.sendto(A2S_INFO if kind == "info" else A2S_PLAYER + b"\xff\xff\xff\xff", a)
+                sock.sendto(QUERY[kind], a)
             except OSError:
                 continue
             sent += 1
@@ -199,7 +213,11 @@ def probe(addrs):
     players = _round(sock, asked, "players", {}, attempts=4)
     time.sleep(2)
     info2 = _round(sock, list(info1), "info", {})
+    time.sleep(1)
+    rules = _round(sock, list(info1), "rules", {})
     sock.close()
+    probe.lang = {"%s:%d" % a: v for a, v in rules.items()}
+    probe.names = {"%s:%d" % a: v["name"] for a, v in info1.items()}
 
     bad = {}
     for a, v in info1.items():
@@ -233,6 +251,76 @@ def probe(addrs):
     return bad
 
 
+def load_countries():
+    """DB-IP country lite (CC BY 4.0, https://db-ip.com): returns ip -> country code, or None"""
+    import bisect, gzip, io
+    t = time.gmtime()
+    months = ["%04d-%02d" % (t.tm_year, t.tm_mon),
+              "%04d-%02d" % (t.tm_year - (t.tm_mon == 1), 12 if t.tm_mon == 1 else t.tm_mon - 1)]
+    for m in months:
+        url = "https://download.db-ip.com/free/dbip-country-lite-%s.csv.gz" % m
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                data = gzip.decompress(r.read())
+        except Exception as e:
+            print("country database %s: %s" % (m, e))
+            continue
+        starts, codes = [], []
+        for line in io.StringIO(data.decode("ascii", "replace")):
+            f = line.strip().split(",")
+            if len(f) < 3 or ":" in f[0]:
+                continue
+            try:
+                a = [int(x) for x in f[0].split(".")]
+            except ValueError:
+                continue
+            starts.append((a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3])
+            codes.append(f[2].strip('"').upper())
+        print("country database %s: %d ranges" % (m, len(starts)))
+
+        def cc(ip):
+            try:
+                a = [int(x) for x in ip.split(".")]
+            except ValueError:
+                return ""
+            i = bisect.bisect_right(starts, (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]) - 1
+            return codes[i] if i >= 0 else ""
+        return cc
+    return None
+
+
+def _word(n, w):
+    return re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", n) is not None
+
+
+def looks_ru_ro(name, cc, lang):
+    """the game's "Hide Russian & Romanian" rules (menus/ServerBrowser.cpp LooksRussianOrRomanian)"""
+    if cc in ("RU", "RO"):
+        return True
+    n = re.sub(r"\^\d", "", name or "").lower()
+    if re.search(r"\.(ru|ro)(?![a-z])", n):
+        return True  # web address: always, even hosted in Ukraine / Moldova
+    if cc in ("UA", "MD"):
+        return False
+    if lang in ("ua", "uk") or lang.startswith("ukr"):
+        return False
+    if _word(n, "md") or "moldova" in n or ".md" in n:
+        return False
+    if re.search("[\u0456\u0457\u0454\u0491\u0406\u0407\u0404\u0490]", name or "") or \
+            _word(n, "ua") or _word(n, "ukr") or _word(n, "ukraine") or "\u0443\u043a\u0440\u0430" in n:
+        return False  # Ukrainian letters / tags
+    if lang in ("ru", "ro") or lang.startswith("russian") or lang.startswith("romanian"):
+        return True
+    if _word(n, "ru"):
+        return True
+    if re.search("[\u0219\u0218\u021b\u021a\u0163\u0162]", name or "") or \
+            (re.search("[\u0103\u0102]", name or "") and cc != "VN"):
+        return True  # Romanian-only letters
+    if _word(n, "romania") or "romanesc" in n or any(_word(n, w) for w in ("romanesti", "jucatori", "gratuit", "gratuita")):
+        return True
+    return re.search("[\u044b\u042b\u044d\u042d\u0451\u0401]", name or "") is not None  # Russian-only letters
+
+
 def main():
     keyfile, out = sys.argv[1], sys.argv[2]
     key = re.sub(r"[^A-Za-z0-9]", "", open(keyfile).read())
@@ -256,20 +344,31 @@ def main():
         except ValueError:
             return True
 
+    # clone farms copy real servers' names, so the real server is in its clones' group too.
+    # The original is the listing on an IP of its own (fewer than 10 listings); clones sit on
+    # farm IPs with hundreds. At most 2 such listings per group, and they must answer.
+    lone = collections.defaultdict(list)
+    for s in servers:
+        if per_ip[ip(s)] < 10:
+            lone[sig(s)].append(s["addr"])
+    def original(s):
+        group = lone.get(sig(s), [])
+        return per_ip[ip(s)] < 10 and len(group) <= 2
+
     why = collections.Counter()
     keep, crowded = [], set()
     for s in servers:
         i, mx, pl = ip(s), s.get("max_players", 0), s.get("players", 0)
         if unroutable(i): why["private/reserved address"] += 1
-        elif per_sig[sig(s)] >= 3: why["farm (same name+map+slots on 3+)"] += 1
+        elif per_sig[sig(s)] >= 3 and not original(s): why["farm (same name+map+slots on 3+)"] += 1
         elif per_ip[i] >= 40: why["40+ on one IP"] += 1
         elif per_net[i.rsplit(".", 1)[0]] >= 200: why["200+ in one /24"] += 1
         elif mx > 32 or mx < 1 or pl > mx: why["impossible slots/players"] += 1
         elif not norm(s.get("name")) or not s.get("map"): why["empty name/map"] += 1
         else:
             keep.append(s["addr"])
-            if per_ip[i] >= 10 or per_net[i.rsplit(".", 1)[0]] >= 50:
-                crowded.add(s["addr"])
+            if per_ip[i] >= 10 or per_net[i.rsplit(".", 1)[0]] >= 50 or per_sig[sig(s)] >= 3:
+                crowded.add(s["addr"])  # must answer to stay
 
     if not keep:
         sys.exit("no servers left, keeping the old list")
@@ -277,7 +376,7 @@ def main():
     bad = probe(keep)
     for a in crowded:
         if a not in bad and a not in probe.answered:
-            bad[a] = "crowded IP/network and didn't answer"
+            bad[a] = "crowded or cloned and didn't answer"
     for reason in bad.values():
         why[reason] += 1
     keep = [a for a in keep if a not in bad]
@@ -286,6 +385,20 @@ def main():
     import os
     os.replace(out + ".tmp", out)
     # second list: the same servers, only those that answered and have no bots
+    # third list: without Russian and Romanian servers
+    cc = load_countries()
+    api_name = {s["addr"]: s.get("name", "") for s in servers}
+    noruro = [a for a in keep if not looks_ru_ro(probe.names.get(a) or api_name.get(a, ""),
+                                                  cc(a.rsplit(":", 1)[0]) if cc else "",
+                                                  probe.lang.get(a, ""))]
+    if cc:
+        out3 = out[:-4] + "_noruro.txt" if out.endswith(".txt") else out + "_noruro"
+        with open(out3 + ".tmp", "w") as f:
+            f.write("\n".join(sorted(noruro)) + "\n")
+        os.replace(out3 + ".tmp", out3)
+        print("%d servers without Russian/Romanian ones written to %s (%d rules answers)" % (len(noruro), out3, len(probe.lang)))
+    else:
+        print("no country database: the list without Russian/Romanian servers was not updated")
     nobots = [a for a in keep if a in probe.no_bots]
     out2 = out[:-4] + "_nobots.txt" if out.endswith(".txt") else out + "_nobots"
     with open(out2 + ".tmp", "w") as f:
