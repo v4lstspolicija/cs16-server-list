@@ -1,9 +1,8 @@
-# CS 1.6 server list (backup)
+# CS 1.6 server list
 
 `steam_servers.txt` is the list of real Counter-Strike 1.6 servers used by the native Mac build of
 the game, one `ip:port` per line. It comes from Valve's master list (Steam Web API
-`IGameServersService/GetServerList`) and is rebuilt once a day by GitHub Actions
-(`.github/workflows/steam-list.yml`).
+`IGameServersService/GetServerList`) and is rebuilt about once an hour.
 
 Fake servers are removed in two steps (see `steam-list.py`):
 

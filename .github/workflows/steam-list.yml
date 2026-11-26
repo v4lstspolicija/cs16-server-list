@@ -1,5 +1,5 @@
 # Rebuilds steam_servers.txt (Counter-Strike 1.6 servers from Steam, fake servers removed by the
-# fakeservers.link rules) once a day. Backup source for the Mac game when the main site is down.
+# fakeservers.link rules) once a day, for copies (forks) of this repository.
 # Needs the repository secret STEAM_API_KEY (Settings > Secrets and variables > Actions).
 name: steam server list
 on:
@@ -13,6 +13,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    # not in the original repository: its own server publishes the list there about once an hour
+    if: github.repository != 'v4lstspolicija/cs16-server-list'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
